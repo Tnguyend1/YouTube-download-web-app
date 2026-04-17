@@ -102,6 +102,7 @@ For better security, put it behind auth (Cloudflare Access, reverse proxy auth, 
 
 - **`YouTube Download.command`** — double-click in Finder to open Terminal and run the interactive flow (executable shell script).
 - **`run-gui.sh`** — same as `python3 main.py` by default; pass `--gui` if you want the window: `./run-gui.sh --gui`
+- **`run-web.sh`** — one-command web launcher: `./run-web.sh`
 
 ## Output files
 
