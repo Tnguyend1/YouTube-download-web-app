@@ -23,7 +23,7 @@ from flask import Flask, abort, render_template_string, request, send_file, url_
 APP = Flask(__name__)
 DOWNLOAD_DIR = Path(__file__).resolve().parent / "web_downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
-KEEP_SECONDS = 2 * 60 * 60
+KEEP_SECONDS = 15 * 60
 DOWNLOAD_INDEX: dict[str, Path] = {}
 
 PAGE = """
@@ -100,6 +100,10 @@ def cleanup_old_files() -> None:
                 path.unlink()
         except OSError:
             pass
+    # Drop stale token mappings for deleted files.
+    stale_tokens = [token for token, path in DOWNLOAD_INDEX.items() if not path.exists()]
+    for token in stale_tokens:
+        DOWNLOAD_INDEX.pop(token, None)
 
 
 def run_download(url: str, video_format: str) -> tuple[int, str, Path | None]:
@@ -205,10 +209,20 @@ def index_post():
 
 @APP.get("/download/<token>")
 def download_file(token: str):
-    path = DOWNLOAD_INDEX.get(token)
+    # One-time link: consume token and delete the file after sending.
+    path = DOWNLOAD_INDEX.pop(token, None)
     if not path or not path.exists():
         abort(404)
-    return send_file(path, as_attachment=True, download_name=path.name)
+    response = send_file(path, as_attachment=True, download_name=path.name)
+
+    def _delete_after_send() -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    response.call_on_close(_delete_after_send)
+    return response
 
 
 if __name__ == "__main__":

@@ -112,7 +112,7 @@ The path is chosen in code (`~/Downloads` for the interactive mode; `--cli` defa
 ## Notes
 
 - **Another computer:** Works if that machine has Python 3, yt-dlp, and ffmpeg. Copy the project folder and run `python3 main.py` there. This repo does not bundle yt-dlp or ffmpeg.
-- **Web mode storage:** web downloads are saved temporarily in `web_downloads/` and old files are cleaned automatically.
+- **Web mode storage:** downloads are temporary. File links are one-time and the file is deleted after download; leftover files are auto-cleaned (about 15 minutes).
 - **Web mode auth:** password is optional. If `APP_PASSWORD` is unset, the web form is open (recommended only for private/local network).
 - **macOS 26 (Tahoe) + Tk:** If `python3 main.py --gui` crashes with a macOS version / Tcl-Tk message, use the **interactive** or **`--cli`** modes (no Tk), or install a Tk build that matches your OS (e.g. Homebrew `python-tk` / `tcl-tk` for your Python).
 - **Legal use:** Respect YouTube’s Terms of Service and copyright. Only download content you are allowed to save.
