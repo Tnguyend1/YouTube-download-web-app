@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YouTube → MP4 via yt-dlp + ffmpeg.
+YouTube downloader via yt-dlp + ffmpeg.
 
 Default: run `python3 main.py`, paste the link, Enter (saves to ~/Downloads).
 
@@ -31,32 +31,43 @@ def find_ffmpeg() -> Optional[str]:
     return shutil.which("ffmpeg")
 
 
-def ytdlp_cmd(url: str, out_dir: str) -> list[str]:
-    return [
+def ytdlp_cmd(url: str, out_dir: str, video_format: str = "mp4") -> list[str]:
+    cmd = [
         *find_yt_dlp(),
         "-f",
         "bv*+ba/bestvideo+bestaudio/best",
-        "--merge-output-format",
-        "mp4",
-        "--remux-video",
-        "mp4",
         "--no-playlist",
         "-o",
         os.path.join(out_dir, "%(title)s [%(id)s].%(ext)s"),
         "--newline",
         "--progress",
-        url,
     ]
+    if video_format == "mov-hevc":
+        cmd += [
+            "--recode-video",
+            "mov",
+            "--postprocessor-args",
+            "VideoConvertor:-c:v libx265 -tag:v hvc1 -c:a aac -b:a 192k",
+        ]
+    else:
+        cmd += [
+            "--merge-output-format",
+            "mp4",
+            "--remux-video",
+            "mp4",
+        ]
+    cmd.append(url)
+    return cmd
 
 
-def download_url(url: str, out_dir: str) -> int:
+def download_url(url: str, out_dir: str, video_format: str = "mp4") -> int:
     """Run yt-dlp; stream output to stdout. Returns process exit code."""
     out_dir = os.path.expanduser(out_dir.strip())
     if not os.path.isdir(out_dir):
         print(f"Folder does not exist: {out_dir}", file=sys.stderr)
         return 1
 
-    cmd = ytdlp_cmd(url.strip(), out_dir)
+    cmd = ytdlp_cmd(url.strip(), out_dir, video_format)
     print("$ " + subprocess.list2cmdline(cmd) + "\n", flush=True)
     try:
         proc = subprocess.Popen(
@@ -84,6 +95,7 @@ def download_url(url: str, out_dir: str) -> int:
 
 def run_interactive() -> int:
     print("Paste YouTube link, then press Enter (saves to Downloads).")
+    print("Type 1 for MP4 (default) or 2 for MOV (HEVC).")
     print("Empty Enter = quit.\n")
     try:
         url = input("URL: ").strip()
@@ -92,15 +104,17 @@ def run_interactive() -> int:
         return 130
     if not url:
         return 0
+    fmt = input("Format [1=MP4, 2=MOV(HEVC)] (default 1): ").strip()
+    video_format = "mov-hevc" if fmt == "2" else "mp4"
     out = os.path.expanduser("~/Downloads")
-    code = download_url(url, out)
+    code = download_url(url, out, video_format)
     if code == 0:
         print("\nSaved under:", out)
     return code
 
 
 def run_cli(argv: list[str]) -> int:
-    p = argparse.ArgumentParser(description="Download a YouTube URL to MP4 (no prompt).")
+    p = argparse.ArgumentParser(description="Download a YouTube URL (MP4 or MOV/HEVC).")
     p.add_argument("url", help="Video URL")
     p.add_argument(
         "-o",
@@ -108,8 +122,15 @@ def run_cli(argv: list[str]) -> int:
         default=os.path.expanduser("~/Downloads"),
         help="Folder for the file (default: ~/Downloads)",
     )
+    p.add_argument(
+        "--format",
+        dest="video_format",
+        choices=("mp4", "mov-hevc"),
+        default="mp4",
+        help="Output format: mp4 (default) or mov-hevc",
+    )
     args = p.parse_args(argv)
-    return download_url(args.url, args.output_dir)
+    return download_url(args.url, args.output_dir, args.video_format)
 
 
 def run_gui() -> None:
@@ -158,7 +179,20 @@ def run_gui() -> None:
             )
             ttk.Button(row, text="Browse…", command=self._pick_dir).pack(side=tk.LEFT)
 
-            self.btn = ttk.Button(frm, text="Download MP4", command=self._start_download)
+            fmt_row = ttk.Frame(frm)
+            fmt_row.pack(fill=tk.X, **pad)
+            ttk.Label(fmt_row, text="Format:").pack(side=tk.LEFT)
+            self.format_var = tk.StringVar(value="mp4")
+            fmt_box = ttk.Combobox(
+                fmt_row,
+                textvariable=self.format_var,
+                values=("mp4", "mov-hevc"),
+                state="readonly",
+                width=12,
+            )
+            fmt_box.pack(side=tk.LEFT, padx=(8, 0))
+
+            self.btn = ttk.Button(frm, text="Download", command=self._start_download)
             self.btn.pack(anchor=tk.W, **pad)
 
             warn = []
@@ -217,7 +251,7 @@ def run_gui() -> None:
             self._append_log("\n---\n")
 
             def run() -> None:
-                cmd = ytdlp_cmd(url, out_dir)
+                cmd = ytdlp_cmd(url, out_dir, self.format_var.get())
                 self._log_queue.put("$ " + subprocess.list2cmdline(cmd) + "\n\n")
                 try:
                     self._proc = subprocess.Popen(
