@@ -16,15 +16,17 @@ import subprocess
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from flask import Flask, abort, render_template_string, request, send_file, url_for
+from flask import Flask, Response, abort, render_template_string, request, send_file, url_for
 
 APP = Flask(__name__)
 DOWNLOAD_DIR = Path(__file__).resolve().parent / "web_downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 KEEP_SECONDS = 15 * 60
-DOWNLOAD_INDEX: dict[str, Path] = {}
+DOWNLOAD_INDEX: dict[str, tuple[Path, float]] = {}
+MAX_URLS = 5
 
 PAGE = """
 <!doctype html>
@@ -52,8 +54,11 @@ PAGE = """
     <h1>YouTube Downloader (Private)</h1>
     <p class="small">For personal use. Downloading may be restricted by platform terms/copyright.</p>
     <form method="post" action="/">
-      <label for="url">YouTube URL</label>
-      <input id="url" name="url" placeholder="https://www.youtube.com/watch?v=..." required>
+      <p class="small">Paste up to {{ max_urls }} links (leave blanks empty).</p>
+      {% for n in range(1, max_urls + 1) %}
+      <label for="url{{ n }}">Link {{ n }}</label>
+      <input id="url{{ n }}" name="url{{ n }}" type="text" inputmode="url" placeholder="https://… or youtu.be/…" autocomplete="off" style="margin-bottom:8px;">
+      {% endfor %}
       {% if require_password %}
       <label for="password">Shared password</label>
       <input id="password" name="password" type="password" required>
@@ -62,7 +67,7 @@ PAGE = """
       {% endif %}
       <label for="format">Format</label>
       <select id="format" name="format">
-        <option value="mp4">MP4 (faster)</option>
+        <option value="mp4">MP4 (iPhone compatible)</option>
         <option value="mov-hevc">MOV (HEVC, slower)</option>
       </select>
       <button type="submit">Download</button>
@@ -70,10 +75,25 @@ PAGE = """
     {% if error %}
       <p class="err">{{ error }}</p>
     {% endif %}
-    {% if file_url %}
+    {% if downloads %}
+      <p class="ok">Done. Tap each link to download:</p>
+      <ul style="padding-left:18px;">
+      {% for d in downloads %}
+        <li style="margin:8px 0;">
+          {% if d.ok %}
+            <a href="{{ d.file_url }}">{{ d.file_name }}</a>
+          {% else %}
+            <span class="err">Failed</span> — <span class="small">{{ d.source_url }}</span>
+            {% if d.log_snippet %}<pre style="margin-top:6px;font-size:12px;">{{ d.log_snippet }}</pre>{% endif %}
+          {% endif %}
+        </li>
+      {% endfor %}
+      </ul>
+      <p class="small">Links stay active for a short time, then auto-clean.</p>
+    {% elif file_url %}
       <p class="ok">Done. Tap to download:</p>
       <p><a href="{{ file_url }}">{{ file_name }}</a></p>
-      <p class="small">Link works while this server is running.</p>
+      <p class="small">Link stays active for a short time, then auto-cleans.</p>
     {% endif %}
     {% if log %}
       <p><strong>yt-dlp output</strong></p>
@@ -92,6 +112,43 @@ def find_yt_dlp() -> list[str]:
     return [sys.executable, "-m", "yt_dlp"]
 
 
+def normalize_url(raw: str) -> str:
+    """Strip junk from mobile paste; add https if user pasted host without scheme."""
+    u = (raw or "").strip()
+    for ch in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+        u = u.replace(ch, "")
+    u = u.strip()
+    if not u:
+        return ""
+    if u.startswith(("http://", "https://")):
+        return u
+    if u.startswith("www.") or "youtube.com" in u or "youtu.be" in u:
+        return "https://" + u.lstrip("/")
+    return u
+
+
+def collect_urls(form) -> list[str]:
+    """Read url1..url5; fallback: legacy textarea or single `url` field."""
+    out: list[str] = []
+    for i in range(1, MAX_URLS + 1):
+        u = normalize_url(form.get(f"url{i}") or "")
+        if u.startswith(("http://", "https://")):
+            out.append(u)
+    if out:
+        return out[:MAX_URLS]
+    blob = (form.get("urls") or "").strip()
+    if blob:
+        for line in blob.splitlines():
+            u = normalize_url(line)
+            if u.startswith(("http://", "https://")):
+                out.append(u)
+        return out[:MAX_URLS]
+    single = normalize_url(form.get("url") or "")
+    if single.startswith(("http://", "https://")):
+        return [single]
+    return []
+
+
 def cleanup_old_files() -> None:
     cutoff = time.time() - KEEP_SECONDS
     for path in DOWNLOAD_DIR.glob("*"):
@@ -101,7 +158,11 @@ def cleanup_old_files() -> None:
         except OSError:
             pass
     # Drop stale token mappings for deleted files.
-    stale_tokens = [token for token, path in DOWNLOAD_INDEX.items() if not path.exists()]
+    stale_tokens = [
+        token
+        for token, (path, created_at) in DOWNLOAD_INDEX.items()
+        if (not path.exists()) or (created_at < cutoff)
+    ]
     for token in stale_tokens:
         DOWNLOAD_INDEX.pop(token, None)
 
@@ -127,11 +188,12 @@ def run_download(url: str, video_format: str) -> tuple[int, str, Path | None]:
             "VideoConvertor:-c:v libx265 -tag:v hvc1 -c:a aac -b:a 192k",
         ]
     else:
+        # Re-encode to iPhone-friendly MP4 (H.264 + AAC) with faststart.
         cmd += [
-            "--merge-output-format",
+            "--recode-video",
             "mp4",
-            "--remux-video",
-            "mp4",
+            "--postprocessor-args",
+            "VideoConvertor:-c:v libx264 -pix_fmt yuv420p -profile:v high -level 4.1 -movflags +faststart -c:a aac -b:a 192k",
         ]
     cmd.append(url)
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -145,7 +207,9 @@ def run_download(url: str, video_format: str) -> tuple[int, str, Path | None]:
 def index_get():
     cleanup_old_files()
     require_password = bool(os.environ.get("APP_PASSWORD", "").strip())
-    return render_template_string(PAGE, require_password=require_password)
+    return render_template_string(
+        PAGE, require_password=require_password, max_urls=MAX_URLS
+    )
 
 
 @APP.post("/")
@@ -153,76 +217,105 @@ def index_post():
     cleanup_old_files()
     shared_password = os.environ.get("APP_PASSWORD", "").strip()
     require_password = bool(shared_password)
+    base = {"require_password": require_password, "max_urls": MAX_URLS}
     if require_password:
         given_password = (request.form.get("password") or "").strip()
         if given_password != shared_password:
             return (
-                render_template_string(PAGE, error="Wrong password.", require_password=True),
+                render_template_string(
+                    PAGE, error="Wrong password.", require_password=True, max_urls=MAX_URLS
+                ),
                 403,
             )
 
-    url = (request.form.get("url") or "").strip()
-    if not url.startswith(("http://", "https://")):
-        return (
-            render_template_string(
-                PAGE, error="Please paste a valid URL.", require_password=require_password
-            ),
-            400,
-        )
-    video_format = (request.form.get("format") or "mp4").strip().lower()
-    if video_format not in {"mp4", "mov-hevc"}:
+    urls = collect_urls(request.form)
+    if not urls:
         return (
             render_template_string(
                 PAGE,
-                error="Format must be mp4 or mov-hevc.",
-                require_password=require_password,
+                error=(
+                    f"Paste at least one valid YouTube URL (https://…), "
+                    f"up to {MAX_URLS} lines (one per line)."
+                ),
+                **base,
             ),
-            400,
+            200,
         )
-    try:
-        code, log, file_path = run_download(url, video_format)
-    except FileNotFoundError:
-        return render_template_string(
-            PAGE,
-            error="yt-dlp not found on server. Install yt-dlp first.",
-            require_password=require_password,
-        ), 500
+    video_format = (request.form.get("format") or "mp4").strip().lower()
+    if video_format not in {"mp4", "mov-hevc"}:
+        video_format = "mp4"
 
-    if code != 0 or file_path is None or not file_path.exists():
-        return render_template_string(
-            PAGE,
-            error="Download failed. See log below.",
-            log=log[-6000:],
-            require_password=require_password,
-        ), 400
+    def run_one(u: str) -> tuple[str, int, str, Path | None]:
+        try:
+            code, log, path = run_download(u, video_format)
+            return u, code, log, path
+        except FileNotFoundError:
+            return u, -1, "yt-dlp not found on server. Install yt-dlp first.\n", None
 
-    token = uuid.uuid4().hex
-    DOWNLOAD_INDEX[token] = file_path
-    return render_template_string(
-        PAGE,
-        file_url=url_for("download_file", token=token),
-        file_name=file_path.name,
-        log=log[-2000:],
-        require_password=require_password,
+    workers = min(len(urls), MAX_URLS)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(run_one, urls))
+
+    downloads: list[dict[str, object]] = []
+    log_chunks: list[str] = []
+    for u, code, log, file_path in results:
+        if code == 0 and file_path is not None and file_path.exists():
+            token = uuid.uuid4().hex
+            DOWNLOAD_INDEX[token] = (file_path, time.time())
+            downloads.append(
+                {
+                    "ok": True,
+                    "source_url": u,
+                    "file_url": url_for("download_file", token=token),
+                    "file_name": file_path.name,
+                }
+            )
+        else:
+            snippet = (log or "")[-2500:]
+            downloads.append(
+                {
+                    "ok": False,
+                    "source_url": u,
+                    "log_snippet": snippet,
+                }
+            )
+            log_chunks.append(f"--- {u}\n{log}")
+
+    any_ok = any(d.get("ok") for d in downloads)
+    return (
+        render_template_string(
+            PAGE,
+            downloads=downloads,
+            log=("\n".join(log_chunks))[-8000:] if not any_ok else None,
+            error=None if any_ok else "All downloads failed. See logs below.",
+            **base,
+        ),
+        200,
     )
 
 
 @APP.get("/download/<token>")
 def download_file(token: str):
-    # One-time link: consume token and delete the file after sending.
-    path = DOWNLOAD_INDEX.pop(token, None)
-    if not path or not path.exists():
+    item = DOWNLOAD_INDEX.get(token)
+    if not item:
         abort(404)
-    response = send_file(path, as_attachment=True, download_name=path.name)
+    path, created_at = item
+    if (not path.exists()) or (time.time() - created_at > KEEP_SECONDS):
+        DOWNLOAD_INDEX.pop(token, None)
+        abort(404)
+    # Force Safari to save into Downloads so users can use their usual Save flow.
+    return send_file(path, as_attachment=True, download_name=path.name)
 
-    def _delete_after_send() -> None:
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
-    response.call_on_close(_delete_after_send)
-    return response
+@APP.get("/favicon.ico")
+def favicon():
+    return Response(status=204)
+
+
+@APP.get("/apple-touch-icon.png")
+@APP.get("/apple-touch-icon-precomposed.png")
+def apple_touch_icon():
+    return Response(status=204)
 
 
 if __name__ == "__main__":
